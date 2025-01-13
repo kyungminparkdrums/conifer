@@ -3,6 +3,7 @@
 #include "nlohmann/json.hpp"
 #include <cassert>
 #include <fstream>
+#include <iostream>
 
 namespace conifer{
 
@@ -22,6 +23,8 @@ constexpr int pow(int x) {
 }
 
 constexpr int pow2(int x) { return pow<2>(x); }
+
+constexpr int ceillog2(int x) { return (x < 2) ? 0 : 1 + ceillog2(x / 2); }
 
 template <class T, class Op>
 T reduce(std::vector<T> x, Op op) {
@@ -43,6 +46,12 @@ template<class T>
 class OpAdd {
 public:
   T operator()(T a, T b) { return a + b; }
+};
+
+template<class T>
+class OpMax {
+public:
+  T operator()(T a, T b) { return (a>b)? a:b; }
 };
 
 template<class T, class U>
@@ -97,6 +106,10 @@ private:
   std::vector<std::vector<DecisionTree<T,U>>> trees;
   OpAdd<U> add;
 
+  // For softmax
+  int table_size = 1024;
+  OpMax<U> max;
+
 public:
 
   // Define how to read this class to/from JSON
@@ -150,6 +163,135 @@ public:
     std::transform(y.begin(), y.end(), std::back_inserter(yd),
                 [](U yi) -> double { return (double) yi; });
     return yd;
+  }
+
+  float softmax_real_val_from_idx(unsigned i) const {
+    // Treat the index as the top N bits
+    //int N = ceillog2(table_size); // number of address bits for table
+    //if (floorlog2(i) <= N) { x = i; }
+    //else { x = (i >> (floorlog2(i)-N)) & ((1<<N)-1);}
+
+    float x = i/16; // scale down?
+    return x;
+  }
+
+  unsigned softmax_idx_from_real_val(T x) const {
+    // Slice the top N bits to get an index into the table
+    //int N = ceillog2(table_size);
+    //unsigned y = (int(x) >> (floorlog2(x)-N)) & ((1<<N)-1); // FIX ME: shouldn't be int(x)
+
+    unsigned y = int(16*x); // scale up
+    return { (y >= table_size) ? (table_size-1):y };
+  }
+
+  std::vector<U> init_exp_table(std::vector<U> lut_exp) const {
+    for (unsigned int i=0; i<table_size; i++) {
+        float x = softmax_real_val_from_idx(i);
+        //std::cout << "x = softmax_real_val_from_idx(i) = " << x << ", ";
+        //U exp_x = exp(x); // scale down here too?
+        U exp_x = exp(x/32); // scale down here too
+        lut_exp[i] = exp_x;
+        //std::cout << "lut_exp[" << i << "] = " << exp_x << ", ";
+    }
+    std::cout << "\nLUT initialized!" << std::endl;
+
+    return lut_exp;
+  }
+
+  std::vector<U> init_invert_table(std::vector<U> lut_inv) const {
+    for (unsigned int i=0; i<table_size; i++) {
+        float x = softmax_real_val_from_idx(i);
+        U inv_x = 1./x;
+        lut_inv[i] = inv_x;
+    }
+
+    return lut_inv;
+  }
+
+  std::vector<U> softmax(std::vector<T> x) const{
+    /* Do the softmax activation here */
+    /*
+    std::vector<U> y_softmax;
+    std::transform(y_raw.begin(), y_raw.end(), std::back_inserter(y_softmax),
+                [](T yi) -> U { return (U) yi/2.; });
+
+    return y_softmax;
+    */
+
+    #pragma HLS pipeline
+    // Initialize the lookup tables
+#ifdef __HLS_SYN__
+    bool initialized = false;
+    std::vector<U> lut_exp = std::vector<U>(table_size);
+    std::vector<U> lut_inv = std::vector<U>(table_size);
+#else
+    static bool initialized = false;
+    static std::vector<U> lut_exp = std::vector<U>(table_size);
+    static std::vector<U> lut_inv = std::vector<U>(table_size);
+#endif
+
+    if (!initialized) {
+        std::cout << "LUT not initialized!" << std::endl;
+        lut_exp = init_exp_table(lut_exp);
+        lut_inv = init_invert_table(lut_inv);
+
+        initialized = true;
+    }
+
+    // Find the max and compute all delta(x_i, x_max)
+    float x_max = reduce<float, OpMax<float>>(x, max);
+    std::vector<float> d_xi_xmax(x.size());
+    for (unsigned i=0; i < x.size(); i++) {
+        #pragma HLS unroll
+        d_xi_xmax[i] = x_max - x[i];
+        //d_xi_xmax[i] = x[i] - x_max;
+    }
+
+    // Calculate all the e^x's
+    std::vector<U> exp_res(x.size());
+    #pragma HLS array_partition variable=exp_res complete
+    U exp_sum(0);
+
+    for (unsigned i=0; i<x.size(); i++) {
+        #pragma HLS unroll
+        //std::cout << "d_xi_xmax[i] = " << d_xi_xmax[i] << std::endl;
+        unsigned d_xi = softmax_idx_from_real_val(d_xi_xmax[i]);
+        exp_res[i] = lut_exp[d_xi];
+        //std::cout << "d_xi = " << d_xi << ", exp from lut = " << exp_res[i] << std::endl;
+    }
+
+    // Explicitly sum the results with an adder tree
+    exp_sum = reduce<U, OpAdd<U>>(exp_res, add);
+
+    std::vector<U> res(x.size());
+    //std::cout << "\nexp_sum = " << exp_sum << std::endl;
+    float inv_exp_sum = lut_inv[softmax_idx_from_real_val(exp_sum)];
+    for (unsigned int i=0; i<x.size(); i++) {
+        #pragma HLS unroll
+        res[i] = exp_res[i] * inv_exp_sum;
+        //res[i] = exp_res[i] / exp_sum;
+    }
+
+    // Convert the U type output back to float
+    std::vector<float> y_softmax;
+    std::transform(res.begin(), res.end(), std::back_inserter(y_softmax),
+                [](U res) -> float { return (float) res; });
+
+    return y_softmax;
+  }
+
+  std::vector<double> _softmax_double(std::vector<double> y_raw) const{
+    /* Cast to U,T from double in/out */
+    std::vector<T> yt_raw;
+    std::transform(y_raw.begin(), y_raw.end(), std::back_inserter(yt_raw),
+                   [](double yi_raw) -> T { return (T) yi_raw; });
+    std::vector<U> y_softmax = softmax(yt_raw);
+    std::vector<double> yd_softmax;
+    std::transform(y_softmax.begin(), y_softmax.end(), std::back_inserter(yd_softmax),
+                [](U yi_softmax) -> double { return (double) yi_softmax; });
+
+    //std::cout << "Softmax! in conifer.h" << std::endl;
+    return yd_softmax;
   }
 
 }; // class BDT

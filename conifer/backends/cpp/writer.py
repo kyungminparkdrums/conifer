@@ -127,6 +127,21 @@ class CPPModel(ModelBase):
   def build():
     raise NotImplementedError
 
+  def softmax(self, Y):
+    #print('softmax in writer.py')
+    cfg = self.config
+    curr_dir = os.getcwd()
+    os.chdir(cfg.output_dir)
+
+    if len(Y.shape) == 1:
+      y = np.array(self.bridge.softmax(Y))
+    elif len(Y.shape) == 2:
+      y = np.array([self.bridge.softmax(yi) for yi in Y])
+    else:
+      raise Exception(f"Can't handle data shape {X.shape}, expected 1D or 2D shape")
+    os.chdir(curr_dir)
+    return y
+
 def auto_config():
     config = {'Backend' : 'cpp',
               'ProjectName': 'my_prj',
